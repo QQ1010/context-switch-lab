@@ -135,3 +135,21 @@ Key learning:
 - Idle time is important in embedded systems.
 - The idle task or idle hook is often where low-power policy begins.
 - This userspace demo only prints the transition; it does not execute MCU-specific instructions.
+
+### Stage 6: Event-Driven Scheduler
+The event-driven version separates event type from task identity.
+
+- `EventType` describes what happened.
+- `target_task_id` decides which task handles it.
+- `value` is a small event payload.
+
+Example routing:
+
+| Event | Target Task | Meaning |
+| --- | --- | --- |
+| `EVENT_TIMER` | `control_task` | periodic control tick |
+| `EVENT_BUTTON` | `control_task` | GPIO button input |
+| `EVENT_UART_RX` | `io_task` | received UART byte |
+| `EVENT_SHUTDOWN` | both tasks | stop the demo task |
+
+This models a common MCU pattern where drivers or ISRs post events into a queue, and tasks process events outside interrupt context.

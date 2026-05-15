@@ -13,8 +13,7 @@ typedef enum {
     TASK_FINISHED
 } TaskState;
 
-struct TCB;
-typedef void (*TaskEntry)(struct TCB *task);
+typedef void (*TaskEntry)(void);
 
 // Task Controll Block
 typedef struct TCB {
@@ -22,9 +21,13 @@ typedef struct TCB {
     const char *name;                   // name
     TaskState state;                    // state
     TaskEntry entry;                    // entry function
-    int step;                           // software progress step
+    ucontext_t context;                 // ucontext
     unsigned char stack[STACK_SIZE];    // per-task stack
 } TCB;
+
+// use ucontext_t scheduler and current task
+static ucontext_t scheduler_context;
+static TCB *current_task = NULL;
 
 static const char *state_name(TaskState state) {
     switch(state) {
@@ -39,46 +42,68 @@ static const char *state_name(TaskState state) {
     }
 }
 
-static void task_yield(TCB *task) {
-    printf("[%s] yield\n", task->name);
-    task->state = TASK_READY;
+static void die(const char *message) {
+    perror(message);
+    exit(EXIT_FAILURE);
 }
 
-static void task_a(TCB *task) {
-    task->step ++;
-    printf("[task_a] step %d\n", task->step);
+static void task_yield() {
+    printf("[%s] yield: %s -> scheduler\n", current_task->name, current_task->name);
     
-    if(task->step >= 3) {
-        printf("[task_a] finished\n");
-        task->state = TASK_FINISHED;
-        return;
+    if(current_task->state != TASK_FINISHED) {
+        current_task->state = TASK_READY;
     }
-    task_yield(task);
+    
+    // save current task context and resume scheduler context
+    if(swapcontext(&current_task->context, &scheduler_context) == -1) {
+        die("swapcontext");
+    }
 }
 
-static void task_b(TCB *task) {
-    task->step ++;
-    printf("[task_b] step %d\n", task->step);
+static void task_a(void) {
     
-    if(task->step >= 3) {
-        printf("[task_b] finished\n");
-        task->state = TASK_FINISHED;
-        return;
+    for(int i = 1 ; i <= 3 ; i++) {
+        printf("[task_a] step %d\n", i);
+        task_yield();
     }
-    task_yield(task);
+    
+    printf("[task_a] finished\n");
+    current_task->state = TASK_FINISHED;
+    task_yield();
+}
+
+static void task_b(void) {
+    for(int i = 1; i <= 3 ; i++) {
+        printf("[task_b] step %d\n", i);
+        task_yield();
+    }
+    
+    printf("[task_b] finished\n");
+    current_task->state = TASK_FINISHED;
+    task_yield();
+}
+
+static void init_task(TCB *task) {
+    if(getcontext(&task->context) == -1) {
+        die("getcontext");
+    }
+    task->context.uc_stack.ss_sp = task->stack;         // start position
+    task->context.uc_stack.ss_size = sizeof(task->stack);   // stack size
+    task->context.uc_stack.ss_flags = 0;                 // 0: stack available
+    task->context.uc_link = &scheduler_context;         // when the task function return, go back to scheduler_context
+    makecontext(&task->context, task->entry, 0);   // first time used to start from task->entry function
 }
 
 static void print_task_table(const TCB tasks[], int count)
 {
     printf("Task table:\n");
-    printf("%-4s %-10s %-10s %-6s %-14s %-10s\n", "ID", "NAME", "STATE", "STEP", "STACK_BASE", "STACK_SIZE");
+    printf("%-4s %-10s %-10s %-14s %-10s\n", "ID", "NAME", "STATE",  "STACK_BASE", "STACK_SIZE");
 
     for (int i = 0; i < count; i++) {
-        printf("%-4d %-10s %-10s %-6d %-14p %-10zu\n",
+        printf("%-4d %-10s %-10s %-14p %-10zu\n",
                 tasks[i].id,
                 tasks[i].name,
                 state_name(tasks[i].state),
-                tasks[i].step,
                 (void *)tasks[i].stack,
                 sizeof(tasks[i].stack)
             );
@@ -101,40 +126,49 @@ static void scheduler_run(TCB tasks[], int count) {
         TCB *task = &tasks[next];
         next = (next + 1) % count;
         
-        if(task->state != TASK_READY) {
+        if(task->state == TASK_FINISHED) {
             continue;
         }
 
-        printf("\n[sheduler] dispatch %s\n", task->name);
+        current_task = task;
         task->state = TASK_RUNNING;
-        task->entry(task);
+
+        printf("\n[scheduler] switch: scheduler -> %s\n", task->name);
+
+        // save scheduler context and resume task context
+        if(swapcontext(&scheduler_context, &task->context) == -1) {
+            die("swapcontext");
+        }
     }
+    current_task = NULL;
+    printf("\n[scheduler] all tasks finished\n");
 }
 
 int main(void)
 {
     printf("context-switch-lab\n");
-    TCB Tasks[TASK_COUNT] = {
+    TCB tasks[TASK_COUNT] = {
         {
             .id = 0,
             .name = "task_a",
             .state = TASK_READY,
             .entry = task_a,
-            .step = 0,
         },
         {
             .id = 1,
             .name = "task_b",
             .state = TASK_READY,
             .entry = task_b,
-            .step = 0,
         }
     };
 
-    print_task_table(Tasks, TASK_COUNT);
-    scheduler_run(Tasks, TASK_COUNT);
-    printf("\n");
-    print_task_table(Tasks, TASK_COUNT);
+    for(int i = 0 ; i < TASK_COUNT; i++) {
+        init_task(&tasks[i]);
+    }
+
+    print_task_table(tasks, TASK_COUNT);
+    scheduler_run(tasks, TASK_COUNT);
+    print_task_table(tasks, TASK_COUNT);
 
     return 0;
 }

@@ -3,9 +3,29 @@
 #include <stdlib.h>
 #include <ucontext.h>
 
-
 #define TASK_COUNT 2
 #define STACK_SIZE (16 * 1024)        // 16 KB = 16 * 1024
+#define EVENT_QUEUE_SIZE 16
+
+typedef enum {
+    EVENT_TIMER,        // TIMER interrupt
+    EVENT_UART_RX,      // UART interrupt
+    EVENT_BUTTON,       // GPIO interrupt
+    EVENT_SHUTDOWN      // shutdown task
+} EventType;
+
+typedef struct {
+    int target_task_id;
+    EventType type;
+    int value;
+} Event;
+
+typedef struct {
+    Event events[EVENT_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+} EventQueue;
 
 typedef enum {
     TASK_READY,
@@ -25,9 +45,28 @@ typedef struct TCB {
     unsigned char stack[STACK_SIZE];    // per-task stack
 } TCB;
 
+// Global variables
 // use ucontext_t scheduler and current task
 static ucontext_t scheduler_context;
 static TCB *current_task = NULL;
+static EventQueue event_queue;
+static Event current_event;
+static bool has_current_event = false;
+
+static const char *event_name(EventType type) {
+    switch(type) {
+        case EVENT_TIMER:
+            return "TIMER";
+        case EVENT_UART_RX:
+            return "UART_RX";
+        case EVENT_BUTTON:
+            return "BUTTON";
+        case EVENT_SHUTDOWN:
+            return "SHUTDOWN";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 static const char *state_name(TaskState state) {
     switch(state) {
@@ -40,6 +79,30 @@ static const char *state_name(TaskState state) {
         default:
             return "UNKNOWN";
     }
+}
+
+static bool event_push(EventQueue *queue, Event event) {
+    if(queue->count == EVENT_QUEUE_SIZE) {
+        return false;
+    }
+
+    queue->events[queue->tail] = event;
+    queue->tail = (queue->tail + 1) % EVENT_QUEUE_SIZE;
+    queue->count ++;
+
+    return true;
+}
+
+static bool event_pop(EventQueue *queue, Event *event) {
+    if(queue->count == 0) {
+        return false;
+    }
+
+    *event = queue->events[queue->head];
+    queue->head = (queue->head+1) % EVENT_QUEUE_SIZE;
+    queue->count --;
+
+    return true;
 }
 
 
@@ -90,27 +153,53 @@ static void task_yield(void) {
     }
 }
 
-static void task_a(void) {
-    
-    for(int i = 1 ; i <= 3 ; i++) {
-        printf("[task_a] step %d\n", i);
-        task_yield();
-    }
-    
-    printf("[task_a] finished\n");
-    current_task->state = TASK_FINISHED;
-    task_yield();
-}
 
-static void task_b(void) {
-    for(int i = 1; i <= 3 ; i++) {
-        printf("[task_b] step %d\n", i);
+static void control_task(void) {
+    while(1) {
+        if(has_current_event) {
+            switch (current_event.type) {
+                case EVENT_TIMER:
+                    printf("[control_task] timer tick=%d\n", current_event.value);
+                    break;
+                case EVENT_BUTTON:
+                    printf("[control_task] button id=%d\n", current_event.value);
+                    break;
+                case EVENT_SHUTDOWN:
+                    printf("[control_task] shutdown\n");
+                    current_task->state = TASK_FINISHED;
+                    task_yield();
+                    return;
+                default:
+                    printf("[control_task] ignored event=%s\n",
+                        event_name(current_event.type));
+                    break;
+            }
+        }
         task_yield();
     }
-    
-    printf("[task_b] finished\n");
-    current_task->state = TASK_FINISHED;
-    task_yield();
+}
+static void io_task(void) {
+    while(1) {
+        if(has_current_event) {
+            switch (current_event.type) {
+                case EVENT_UART_RX:
+                    printf("[io_task] uart rx='%c' (%d)\n",
+                        current_event.value,
+                        current_event.value);
+                    break;
+                case EVENT_SHUTDOWN:
+                    printf("[io_task] shutdown\n");
+                    current_task->state = TASK_FINISHED;
+                    task_yield();
+                    return;
+                default:
+                    printf("[io_task] ignored event=%s\n",
+                        event_name(current_event.type));
+                    break;
+            }
+        }
+        task_yield();
+    }
 }
 
 static void init_task(TCB *task) {
@@ -134,49 +223,50 @@ static bool all_tasks_finished(const TCB tasks[], int count) {
     return true;
 }
 
-static bool has_ready_task(const TCB tasks[], int count) {
-    for(int i = 0 ; i < count; i++) {
-        if(tasks[i].state == TASK_READY) {
-            return true;
-        }
-    }
-    return false;
-}
 
 static void idle_hook(void) {
-    printf("[idle] no runnable tasks; MCU cound enter WFI/WFE here\n");
+    printf("[idle] no runnable tasks; MCU could enter WFI/WFE here\n");
 }
 
 static void scheduler_run(TCB tasks[], int count) {
-    int next = 0;
     while(!all_tasks_finished(tasks, count)) {
-        if (!has_ready_task(tasks, count)) {
+        Event event;
+
+        if(!event_pop(&event_queue, &event)) {
             idle_hook();
             break;
         }
 
-        TCB *task = &tasks[next];
-        next = (next + 1) % count;
-        
-        if(task->state != TASK_READY) {
+        if(event.target_task_id < 0 || event.target_task_id >= count) {
+            printf("[scheduler] drop invalid event target=%d\n", event.target_task_id);
             continue;
         }
+
+        TCB *task = &tasks[event.target_task_id];
+
+        if(task->state == TASK_FINISHED) {
+            printf("[scheduler] drop event for finished task=%s\n", task->name);
+            continue;
+        }
+
+        current_event = event;
+        has_current_event = true;
 
         current_task = task;
         task->state = TASK_RUNNING;
 
-        printf("\n[scheduler] switch: scheduler -> %s\n", task->name);
+        printf("[scheduler] event %s -> %s\n", event_name(event.type), task->name);
         trace_context("restore", task);
 
-        // save scheduler context and resume task context
         if(swapcontext(&scheduler_context, &task->context) == -1) {
             die("swapcontext");
         }
+        has_current_event = false;
     }
     current_task = NULL;
-    printf("\n[scheduler] all tasks finished\n");
-    idle_hook();
+    printf("\n[scheduler] event loop stopped\n");
 }
+
 
 int main(void)
 {
@@ -184,15 +274,15 @@ int main(void)
     TCB tasks[TASK_COUNT] = {
         {
             .id = 0,
-            .name = "task_a",
+            .name = "control_task",
             .state = TASK_READY,
-            .entry = task_a,
+            .entry = control_task,
         },
         {
             .id = 1,
-            .name = "task_b",
+            .name = "io_task",
             .state = TASK_READY,
-            .entry = task_b,
+            .entry = io_task,
         }
     };
 
@@ -201,7 +291,16 @@ int main(void)
     }
 
     print_task_table(tasks, TASK_COUNT);
-    scheduler_run(tasks, TASK_COUNT);
+
+    event_push(&event_queue, (Event){0, EVENT_TIMER, 1});
+    event_push(&event_queue, (Event){1, EVENT_UART_RX, 'A'});
+    event_push(&event_queue, (Event){0, EVENT_BUTTON, 2});
+    event_push(&event_queue, (Event){1, EVENT_UART_RX, 'B'});
+    event_push(&event_queue, (Event){0, EVENT_SHUTDOWN, 0});
+    event_push(&event_queue, (Event){1, EVENT_SHUTDOWN, 0});
+
+    
+    scheduler_run(tasks, TASK_COUNT); 
     print_task_table(tasks, TASK_COUNT);
 
     return 0;

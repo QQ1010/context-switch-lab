@@ -1,8 +1,11 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <ucontext.h>
 
 
 #define TASK_COUNT 2
+#define STACK_SIZE (16 * 1024)        // 16 KB = 16 * 1024
 
 typedef enum {
     TASK_READY,
@@ -15,11 +18,12 @@ typedef void (*TaskEntry)(struct TCB *task);
 
 // Task Controll Block
 typedef struct TCB {
-    int id;
-    const char *name;
-    TaskState state;
-    TaskEntry entry;
-    int step;
+    int id;                             // task id
+    const char *name;                   // name
+    TaskState state;                    // state
+    TaskEntry entry;                    // entry function
+    int step;                           // software progress step
+    unsigned char stack[STACK_SIZE];    // per-task stack
 } TCB;
 
 static const char *state_name(TaskState state) {
@@ -67,14 +71,17 @@ static void task_b(TCB *task) {
 static void print_task_table(const TCB tasks[], int count)
 {
     printf("Task table:\n");
-    printf("%-4s %-10s %-10s %-6s\n", "ID", "NAME", "STATE", "STEP");
+    printf("%-4s %-10s %-10s %-6s %-14s %-10s\n", "ID", "NAME", "STATE", "STEP", "STACK_BASE", "STACK_SIZE");
 
     for (int i = 0; i < count; i++) {
-        printf("%-4d %-10s %-10s %-6d\n",
-               tasks[i].id,
-               tasks[i].name,
-               state_name(tasks[i].state),
-               tasks[i].step);
+        printf("%-4d %-10s %-10s %-6d %-14p %-10zu\n",
+                tasks[i].id,
+                tasks[i].name,
+                state_name(tasks[i].state),
+                tasks[i].step,
+                (void *)tasks[i].stack,
+                sizeof(tasks[i].stack)
+            );
     }
 }
 
@@ -101,7 +108,6 @@ static void scheduler_run(TCB tasks[], int count) {
         printf("\n[sheduler] dispatch %s\n", task->name);
         task->state = TASK_RUNNING;
         task->entry(task);
-
     }
 }
 
@@ -109,8 +115,20 @@ int main(void)
 {
     printf("context-switch-lab\n");
     TCB Tasks[TASK_COUNT] = {
-        {0, "task_a", TASK_READY, task_a, 0},
-        {1, "task_b", TASK_READY, task_b, 0},
+        {
+            .id = 0,
+            .name = "task_a",
+            .state = TASK_READY,
+            .entry = task_a,
+            .step = 0,
+        },
+        {
+            .id = 1,
+            .name = "task_b",
+            .state = TASK_READY,
+            .entry = task_b,
+            .step = 0,
+        }
     };
 
     print_task_table(Tasks, TASK_COUNT);

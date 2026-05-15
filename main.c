@@ -21,7 +21,7 @@ typedef struct TCB {
     const char *name;                   // name
     TaskState state;                    // state
     TaskEntry entry;                    // entry function
-    ucontext_t context;                 // ucontext
+    ucontext_t context;                 // ucontext, include program counter, stack pointer, registers, signal mask, stack information, link context
     unsigned char stack[STACK_SIZE];    // per-task stack
 } TCB;
 

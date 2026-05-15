@@ -15,7 +15,7 @@ typedef enum {
 
 typedef void (*TaskEntry)(void);
 
-// Task Controll Block
+// Task Control Block
 typedef struct TCB {
     int id;                             // task id
     const char *name;                   // name
@@ -42,18 +42,48 @@ static const char *state_name(TaskState state) {
     }
 }
 
+
+static void trace_context(const char *action, const TCB *task) {
+    printf("[context] %-7s task=%s stack_base=%p stack_size=%zu state=%s\n",
+        action,
+        task->name,
+        (void *) task->stack,
+        sizeof(task->stack),
+        state_name(task->state)
+    );
+}
+
+static void print_task_table(const TCB tasks[], int count)
+{
+    printf("Task table:\n");
+    printf("%-4s %-10s %-10s %-14s %-10s\n", "ID", "NAME", "STATE",  "STACK_BASE", "STACK_SIZE");
+
+    for (int i = 0; i < count; i++) {
+        printf("%-4d %-10s %-10s %-14p %-10zu\n",
+                tasks[i].id,
+                tasks[i].name,
+                state_name(tasks[i].state),
+                (void *)tasks[i].stack,
+                sizeof(tasks[i].stack)
+            );
+    }
+}
+
+
 static void die(const char *message) {
     perror(message);
     exit(EXIT_FAILURE);
 }
 
-static void task_yield() {
+static void task_yield(void) {
     printf("[%s] yield: %s -> scheduler\n", current_task->name, current_task->name);
     
     if(current_task->state != TASK_FINISHED) {
         current_task->state = TASK_READY;
     }
     
+    trace_context("save", current_task);
+
     // save current task context and resume scheduler context
     if(swapcontext(&current_task->context, &scheduler_context) == -1) {
         die("swapcontext");
@@ -94,22 +124,6 @@ static void init_task(TCB *task) {
     makecontext(&task->context, task->entry, 0);   // first time used to start from task->entry function
 }
 
-static void print_task_table(const TCB tasks[], int count)
-{
-    printf("Task table:\n");
-    printf("%-4s %-10s %-10s %-14s %-10s\n", "ID", "NAME", "STATE",  "STACK_BASE", "STACK_SIZE");
-
-    for (int i = 0; i < count; i++) {
-        printf("%-4d %-10s %-10s %-14p %-10zu\n",
-                tasks[i].id,
-                tasks[i].name,
-                state_name(tasks[i].state),
-                (void *)tasks[i].stack,
-                sizeof(tasks[i].stack)
-            );
-    }
-}
-
 
 static bool all_tasks_finished(const TCB tasks[], int count) {
     for(int i = 0 ; i < count; i++) {
@@ -120,13 +134,31 @@ static bool all_tasks_finished(const TCB tasks[], int count) {
     return true;
 }
 
+static bool has_ready_task(const TCB tasks[], int count) {
+    for(int i = 0 ; i < count; i++) {
+        if(tasks[i].state == TASK_READY) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void idle_hook(void) {
+    printf("[idle] no runnable tasks; MCU cound enter WFI/WFE here\n");
+}
+
 static void scheduler_run(TCB tasks[], int count) {
     int next = 0;
     while(!all_tasks_finished(tasks, count)) {
+        if (!has_ready_task(tasks, count)) {
+            idle_hook();
+            break;
+        }
+
         TCB *task = &tasks[next];
         next = (next + 1) % count;
         
-        if(task->state == TASK_FINISHED) {
+        if(task->state != TASK_READY) {
             continue;
         }
 
@@ -134,6 +166,7 @@ static void scheduler_run(TCB tasks[], int count) {
         task->state = TASK_RUNNING;
 
         printf("\n[scheduler] switch: scheduler -> %s\n", task->name);
+        trace_context("restore", task);
 
         // save scheduler context and resume task context
         if(swapcontext(&scheduler_context, &task->context) == -1) {
@@ -142,6 +175,7 @@ static void scheduler_run(TCB tasks[], int count) {
     }
     current_task = NULL;
     printf("\n[scheduler] all tasks finished\n");
+    idle_hook();
 }
 
 int main(void)

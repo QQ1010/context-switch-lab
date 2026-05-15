@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdbool.h>
+
 
 #define TASK_COUNT 2
 
@@ -8,7 +10,8 @@ typedef enum {
     TASK_FINISHED
 } TaskState;
 
-typedef void (*TaskEntry)(void);
+struct TCB;
+typedef void (*TaskEntry)(struct TCB *task);
 
 // Task Controll Block
 typedef struct TCB {
@@ -16,6 +19,7 @@ typedef struct TCB {
     const char *name;
     TaskState state;
     TaskEntry entry;
+    int step;
 } TCB;
 
 static const char *state_name(TaskState state) {
@@ -31,33 +35,73 @@ static const char *state_name(TaskState state) {
     }
 }
 
-static void task_a(void) {
-    printf("[task a] running\n");
+static void task_yield(TCB *task) {
+    printf("[%s] yield\n", task->name);
+    task->state = TASK_READY;
 }
 
-static void task_b(void) {
-    printf("[task b] running\n");
+static void task_a(TCB *task) {
+    task->step ++;
+    printf("[task_a] step %d\n", task->step);
+    
+    if(task->step >= 3) {
+        printf("[task_a] finished\n");
+        task->state = TASK_FINISHED;
+        return;
+    }
+    task_yield(task);
 }
 
-static void printf_task_table(const TCB tasks[], int count) {
-    printf("Task Table:\n");
-    printf("%-4s %-10s %-10s\n", "ID", "NAME", "STATE");
-    for(int i = 0 ; i < count; i ++) {
-        printf("%-4d %-10s %-10s\n", tasks[i].id, tasks[i].name, state_name(tasks[i].state));
+static void task_b(TCB *task) {
+    task->step ++;
+    printf("[task_b] step %d\n", task->step);
+    
+    if(task->step >= 3) {
+        printf("[task_b] finished\n");
+        task->state = TASK_FINISHED;
+        return;
+    }
+    task_yield(task);
+}
+
+static void print_task_table(const TCB tasks[], int count)
+{
+    printf("Task table:\n");
+    printf("%-4s %-10s %-10s %-6s\n", "ID", "NAME", "STATE", "STEP");
+
+    for (int i = 0; i < count; i++) {
+        printf("%-4d %-10s %-10s %-6d\n",
+               tasks[i].id,
+               tasks[i].name,
+               state_name(tasks[i].state),
+               tasks[i].step);
     }
 }
 
-static void sheduler_run(TCB tasks[], int count) {
+
+static bool all_tasks_finished(const TCB tasks[], int count) {
     for(int i = 0 ; i < count; i++) {
-        TCB *task = &tasks[i];
+        if(tasks[i].state != TASK_FINISHED) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void scheduler_run(TCB tasks[], int count) {
+    int next = 0;
+    while(!all_tasks_finished(tasks, count)) {
+        TCB *task = &tasks[next];
+        next = (next + 1) % count;
+        
         if(task->state != TASK_READY) {
             continue;
         }
+
         printf("\n[sheduler] dispatch %s\n", task->name);
         task->state = TASK_RUNNING;
-        task->entry();
-        task->state = TASK_FINISHED;
-        printf("[scheduler] %s finished\n", task->name);
+        task->entry(task);
+
     }
 }
 
@@ -65,14 +109,14 @@ int main(void)
 {
     printf("context-switch-lab\n");
     TCB Tasks[TASK_COUNT] = {
-        {0, "task_a", TASK_READY, task_a},
-        {1, "task_b", TASK_READY, task_b},
+        {0, "task_a", TASK_READY, task_a, 0},
+        {1, "task_b", TASK_READY, task_b, 0},
     };
 
-    printf_task_table(Tasks, TASK_COUNT);
-    sheduler_run(Tasks, TASK_COUNT);
+    print_task_table(Tasks, TASK_COUNT);
+    scheduler_run(Tasks, TASK_COUNT);
     printf("\n");
-    printf_task_table(Tasks, TASK_COUNT);
+    print_task_table(Tasks, TASK_COUNT);
 
     return 0;
 }

@@ -11,3 +11,9 @@ This project starts as a Linux userspace prototype. It uses cooperative tasks to
 - how the idea maps to MCU RTOS concepts such as SysTick, PendSV, SP, PC, and saved registers
 
 This is not a production RTOS. The goal is clarity for learning.
+
+### Run Command
+```
+docker build -t context-switch-lab .
+docker run --rm context-switch-lab
+```

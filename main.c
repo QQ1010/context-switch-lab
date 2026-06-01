@@ -7,6 +7,9 @@
 #define STACK_SIZE (16 * 1024)        // 16 KB = 16 * 1024
 #define EVENT_QUEUE_SIZE 16
 
+static bool in_critical = false;
+static int system_tick = 0;
+
 typedef enum {
     EVENT_TIMER,        // TIMER interrupt
     EVENT_UART_RX,      // UART interrupt
@@ -30,6 +33,7 @@ typedef struct {
 typedef enum {
     TASK_READY,
     TASK_RUNNING,
+    TASK_BLOCKED,
     TASK_FINISHED
 } TaskState;
 
@@ -40,6 +44,7 @@ typedef struct TCB {
     int id;                             // task id
     const char *name;                   // name
     TaskState state;                    // state
+    int wake_tick;                      // system_tick >= wake_tick, wake up
     TaskEntry entry;                    // entry function
     ucontext_t context;                 // ucontext, include program counter, stack pointer, registers, signal mask, stack information, link context
     unsigned char stack[STACK_SIZE];    // per-task stack
@@ -76,12 +81,49 @@ static const char *state_name(TaskState state) {
             return "RUNNING";
         case TASK_FINISHED:
             return "FINISHED";
+        case TASK_BLOCKED:
+            return "BLOCKED";
         default:
             return "UNKNOWN";
     }
 }
 
+static void scheduler_tick(TCB tasks[], int count) {
+    system_tick++;
+
+    printf("[tick] system_tick=%d\n", system_tick);
+
+    for (int i = 0; i < count; i++) {
+        if (tasks[i].state == TASK_BLOCKED &&
+            system_tick >= tasks[i].wake_tick) {
+            tasks[i].state = TASK_READY;
+            printf("[tick] wake %s\n", tasks[i].name);
+        }
+    }
+}
+
+static void enter_critical(void) {
+    if(in_critical) {
+        printf("[critical] nested enter\n");
+        return;
+    }
+    in_critical = true;
+    printf("[critical] enter\n");
+}
+
+static void exit_critical(void) {
+    if(!in_critical) {
+        printf("[critical] exit without enter\n");
+        return;
+    }
+    in_critical = false;
+    printf("[critical] exit\n");
+}
+
 static bool event_push(EventQueue *queue, Event event) {
+    
+    enter_critical();
+    
     if(queue->count == EVENT_QUEUE_SIZE) {
         return false;
     }
@@ -90,10 +132,19 @@ static bool event_push(EventQueue *queue, Event event) {
     queue->tail = (queue->tail + 1) % EVENT_QUEUE_SIZE;
     queue->count ++;
 
+    printf("[event_queue] push %s -> target=%d value=%d\n",
+           event_name(event.type),
+           event.target_task_id,
+           event.value);
+
+    exit_critical();
     return true;
 }
 
 static bool event_pop(EventQueue *queue, Event *event) {
+    
+    enter_critical();
+    
     if(queue->count == 0) {
         return false;
     }
@@ -102,6 +153,12 @@ static bool event_pop(EventQueue *queue, Event *event) {
     queue->head = (queue->head+1) % EVENT_QUEUE_SIZE;
     queue->count --;
 
+    printf("[event_queue] pop %s -> target=%d value=%d\n",
+           event_name(event->type),
+           event->target_task_id,
+           event->value);
+
+    exit_critical();
     return true;
 }
 
@@ -141,7 +198,7 @@ static void die(const char *message) {
 static void task_yield(void) {
     printf("[%s] yield: %s -> scheduler\n", current_task->name, current_task->name);
     
-    if(current_task->state != TASK_FINISHED) {
+    if(current_task->state == TASK_RUNNING) {
         current_task->state = TASK_READY;
     }
     
@@ -153,6 +210,21 @@ static void task_yield(void) {
     }
 }
 
+static void task_delay(int ticks) {
+    if(ticks <= 0) {
+        return ;
+    }
+    current_task->wake_tick = system_tick + ticks;
+    current_task->state = TASK_BLOCKED;
+
+    printf("[%s] delay %d ticks: wake_tick=%d\n",
+           current_task->name,
+           ticks,
+           current_task->wake_tick);
+
+    task_yield();
+
+}
 
 static void control_task(void) {
     while(1) {
@@ -160,6 +232,7 @@ static void control_task(void) {
             switch (current_event.type) {
                 case EVENT_TIMER:
                     printf("[control_task] timer tick=%d\n", current_event.value);
+                    task_delay(2);
                     break;
                 case EVENT_BUTTON:
                     printf("[control_task] button id=%d\n", current_event.value);
@@ -249,6 +322,15 @@ static void scheduler_run(TCB tasks[], int count) {
             continue;
         }
 
+        if (task->state == TASK_BLOCKED) {
+            printf("[scheduler] target task blocked, defer event=%s for %s\n",
+                event_name(event.type),
+                task->name);
+            event_push(&event_queue, event);
+            scheduler_tick(tasks, count);
+            continue;
+        }
+
         current_event = event;
         has_current_event = true;
 
@@ -262,6 +344,7 @@ static void scheduler_run(TCB tasks[], int count) {
             die("swapcontext");
         }
         has_current_event = false;
+        scheduler_tick(tasks, count);
     }
     current_task = NULL;
     printf("\n[scheduler] event loop stopped\n");

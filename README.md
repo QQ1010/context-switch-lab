@@ -107,7 +107,7 @@ To make the context switch visible, the project added trace output:
 Conceptually, this saves the task's PC, SP, and registers into its context.
 
 `[context] restore` means than the scheduler is about to resume a task.
-Conceptually, this resores that task's PC, SP, and registers so execution continues from the previous yield point.
+Conceptually, this restores that task's PC, SP, and registers so execution continues from the previous yield point.
 
 Key learning:
 
@@ -153,3 +153,43 @@ Example routing:
 | `EVENT_SHUTDOWN` | both tasks | stop the demo task |
 
 This models a common MCU pattern where drivers or ISRs post events into a queue, and tasks process events outside interrupt context.
+
+### Stage 7: Critical Section
+
+After introducing event delivery, the project added a simulated critical section.
+
+In an MCU system, event delivery may be triggered by an ISR or driver callback, while the scheduler or tasks may also access shared task state. Shared fields such as pending events and task state should be protected from concurrent modification.
+
+This demo uses:
+
+```c
+enter_critical();
+...
+exit_critical();
+```
+In this userspace demo, enter_critical() and exit_critical() only print trace messages. In real MCU firmware, this is where interrupt masking, scheduler locking, or another RTOS-provided protection mechanism could be used.
+
+### Stage 8: Priority Scheduling
+
+The final version adds priority-based scheduling.
+
+Each task has a priority field in its TCB:
+
+```c
+int priority;
+```
+This project uses the rule:
+
+```text
+smaller priority value = higher priority
+```
+Events are delivered directly to the target task by `post_event()`
+
+The scheduler then selects the highest-priority task that is both READY and has pending work:
+```
+TASK_READY && has_pending_event
+```
+This separates two ideas:
+
+- `post_event()` performs event delivery.
+- `scheduler_run()` performs scheduling policy.

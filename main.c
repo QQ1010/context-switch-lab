@@ -1,3 +1,18 @@
+/*
+ * context-switch-lab
+ *
+ * A small userspace C demo for learning RTOS-style scheduling.
+ *
+ * This version demonstrates:
+ * - Task Control Blocks (TCB)
+ * - per-task stacks
+ * - ucontext-based context save/restore
+ * - event posting to target tasks
+ * - priority-based task selection
+ * - an idle hook that maps to MCU low-power concepts
+ *
+ * This is not a production RTOS. It is a learning model.
+ */
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -5,10 +20,8 @@
 
 #define TASK_COUNT 2
 #define STACK_SIZE (16 * 1024)        // 16 KB = 16 * 1024
-#define EVENT_QUEUE_SIZE 16
 
 static bool in_critical = false;
-static int system_tick = 0;
 
 typedef enum {
     EVENT_TIMER,        // TIMER interrupt
@@ -17,44 +30,63 @@ typedef enum {
     EVENT_SHUTDOWN      // shutdown task
 } EventType;
 
+
+/*
+ * Event model.
+ *
+ * In a real MCU system, events may come from ISRs or drivers:
+ * - timer interrupt
+ * - UART RX interrupt
+ * - GPIO/button interrupt
+ *
+ * target_task_id decides which task owns the event.
+ * value is a small demo payload.
+ */
 typedef struct {
     int target_task_id;
     EventType type;
     int value;
 } Event;
 
-typedef struct {
-    Event events[EVENT_QUEUE_SIZE];
-    int head;
-    int tail;
-    int count;
-} EventQueue;
-
 typedef enum {
-    TASK_READY,
-    TASK_RUNNING,
-    TASK_BLOCKED,
-    TASK_FINISHED
+    TASK_READY,             // task can be selected by the scheduler
+    TASK_RUNNING,           // task is currently executing
+    TASK_FINISHED           // task will no longer be scheduled
 } TaskState;
 
 typedef void (*TaskEntry)(void);
 
-// Task Control Block
+/*
+ * Task Control Block.
+ *
+ * In an RTOS, the scheduler does not manage raw functions directly.
+ * It manages TCBs. A TCB stores task metadata and the saved execution
+ * context needed to resume a task later.
+ *
+ * ucontext_t is used here as a userspace stand-in for saved CPU context:
+ * conceptually PC, SP, registers, signal mask, stack info, and link context.
+ */
 typedef struct TCB {
     int id;                             // task id
     const char *name;                   // name
     TaskState state;                    // state
-    int wake_tick;                      // system_tick >= wake_tick, wake up
+    int priority;                       // smaller value has higher priority
     TaskEntry entry;                    // entry function
     ucontext_t context;                 // ucontext, include program counter, stack pointer, registers, signal mask, stack information, link context
     unsigned char stack[STACK_SIZE];    // per-task stack
+    bool has_pending_event;             // true if this task has one event waiting
+    Event pending_event;                // single pending event slot for this task
 } TCB;
 
-// Global variables
-// use ucontext_t scheduler and current task
+/*
+ * Global scheduler state.
+ *
+ * scheduler_context stores where the scheduler should resume.
+ * current_task points to the task currently running.
+ * current_event is the event currently being handled by the running task.
+ */
 static ucontext_t scheduler_context;
 static TCB *current_task = NULL;
-static EventQueue event_queue;
 static Event current_event;
 static bool has_current_event = false;
 
@@ -81,27 +113,19 @@ static const char *state_name(TaskState state) {
             return "RUNNING";
         case TASK_FINISHED:
             return "FINISHED";
-        case TASK_BLOCKED:
-            return "BLOCKED";
         default:
             return "UNKNOWN";
     }
 }
 
-static void scheduler_tick(TCB tasks[], int count) {
-    system_tick++;
 
-    printf("[tick] system_tick=%d\n", system_tick);
-
-    for (int i = 0; i < count; i++) {
-        if (tasks[i].state == TASK_BLOCKED &&
-            system_tick >= tasks[i].wake_tick) {
-            tasks[i].state = TASK_READY;
-            printf("[tick] wake %s\n", tasks[i].name);
-        }
-    }
-}
-
+/*
+* Simulated critical section.
+*
+* In real MCU firmware, this is where interrupt masking or a scheduler lock
+* could protect shared state. Here it only prints trace messages and tracks
+* whether we are inside a critical section.
+*/
 static void enter_critical(void) {
     if(in_critical) {
         printf("[critical] nested enter\n");
@@ -120,46 +144,56 @@ static void exit_critical(void) {
     printf("[critical] exit\n");
 }
 
-static bool event_push(EventQueue *queue, Event event) {
-    
+static bool post_event(TCB tasks[], int count, Event event) {
+    /*
+    * Post an event directly to its target task.
+    *
+    * This separates event delivery from scheduling policy:
+    * - post_event() delivers work to a target task.
+    * - scheduler_run() decides which READY task runs first.
+    *
+    * For clarity, each task only has one pending event slot. If another event is
+    * posted before the previous one is handled, the new event is dropped.
+    * A production RTOS would usually use a per-task queue or task notification.
+    */
     enter_critical();
-    
-    if(queue->count == EVENT_QUEUE_SIZE) {
+
+    if(event.target_task_id < 0 || event.target_task_id >= count) {
+        printf("[scheduler] drop invalid event target=%d\n", event.target_task_id);
+        exit_critical();
         return false;
     }
 
-    queue->events[queue->tail] = event;
-    queue->tail = (queue->tail + 1) % EVENT_QUEUE_SIZE;
-    queue->count ++;
+    TCB *target = &tasks[event.target_task_id];
+    
+    if(target->state == TASK_FINISHED) {
+        printf("[scheduler] drop event for finished task=%s\n", target->name);
+        exit_critical();
+        return false;
+    }
+    
 
-    printf("[event_queue] push %s -> target=%d value=%d\n",
+    if (target->has_pending_event) {
+        printf("[scheduler] target already has pending event, defer event=%s for %s\n",
+            event_name(event.type),
+            target->name);
+        exit_critical();
+        return false;
+    }
+
+    target->pending_event = event;
+    target->has_pending_event = true;
+    target->state = TASK_READY;
+
+    printf("[event] post %s -> %s priority=%d value=%d\n",
            event_name(event.type),
-           event.target_task_id,
+           target->name,
+           target->priority,
            event.value);
 
     exit_critical();
     return true;
-}
 
-static bool event_pop(EventQueue *queue, Event *event) {
-    
-    enter_critical();
-    
-    if(queue->count == 0) {
-        return false;
-    }
-
-    *event = queue->events[queue->head];
-    queue->head = (queue->head+1) % EVENT_QUEUE_SIZE;
-    queue->count --;
-
-    printf("[event_queue] pop %s -> target=%d value=%d\n",
-           event_name(event->type),
-           event->target_task_id,
-           event->value);
-
-    exit_critical();
-    return true;
 }
 
 
@@ -176,13 +210,14 @@ static void trace_context(const char *action, const TCB *task) {
 static void print_task_table(const TCB tasks[], int count)
 {
     printf("Task table:\n");
-    printf("%-4s %-10s %-10s %-14s %-10s\n", "ID", "NAME", "STATE",  "STACK_BASE", "STACK_SIZE");
+    printf("%-4s %-10s %-10s  %-6s %-14s %-10s\n", "ID", "NAME", "STATE", "PRIO",  "STACK_BASE", "STACK_SIZE");
 
     for (int i = 0; i < count; i++) {
-        printf("%-4d %-10s %-10s %-14p %-10zu\n",
+        printf("%-4d %-10s %-10s %-6d %-14p %-10zu\n",
                 tasks[i].id,
                 tasks[i].name,
                 state_name(tasks[i].state),
+                tasks[i].priority,
                 (void *)tasks[i].stack,
                 sizeof(tasks[i].stack)
             );
@@ -196,6 +231,15 @@ static void die(const char *message) {
 }
 
 static void task_yield(void) {
+    /*
+    * Cooperative yield.
+    *
+    * The running task saves its context and returns control to the scheduler.
+    * If the task is still RUNNING, it becomes READY again.
+    *
+    * swapcontext() conceptually saves PC/SP/registers into current_task->context
+    * and restores scheduler_context.
+    */
     printf("[%s] yield: %s -> scheduler\n", current_task->name, current_task->name);
     
     if(current_task->state == TASK_RUNNING) {
@@ -210,29 +254,12 @@ static void task_yield(void) {
     }
 }
 
-static void task_delay(int ticks) {
-    if(ticks <= 0) {
-        return ;
-    }
-    current_task->wake_tick = system_tick + ticks;
-    current_task->state = TASK_BLOCKED;
-
-    printf("[%s] delay %d ticks: wake_tick=%d\n",
-           current_task->name,
-           ticks,
-           current_task->wake_tick);
-
-    task_yield();
-
-}
-
 static void control_task(void) {
     while(1) {
         if(has_current_event) {
             switch (current_event.type) {
                 case EVENT_TIMER:
                     printf("[control_task] timer tick=%d\n", current_event.value);
-                    task_delay(2);
                     break;
                 case EVENT_BUTTON:
                     printf("[control_task] button id=%d\n", current_event.value);
@@ -276,6 +303,12 @@ static void io_task(void) {
 }
 
 static void init_task(TCB *task) {
+    /*
+    * Initialize a task context.
+    *
+    * Each task gets its own stack buffer. makecontext() sets the initial program
+    * counter so the task starts from its entry function the first time it runs.
+    */
     if(getcontext(&task->context) == -1) {
         die("getcontext");
     }
@@ -296,56 +329,73 @@ static bool all_tasks_finished(const TCB tasks[], int count) {
     return true;
 }
 
+static TCB *select_highest_priority_ready_task(TCB tasks[], int count) {
+    /*
+    * Priority scheduler policy.
+    *
+    * Select the READY task with pending work and the highest priority.
+    * This demo uses a common convention: smaller priority number means higher
+    * priority.
+    */
+    TCB *best = NULL;
+    for(int i = 0 ; i < count; i++) {
+        if(tasks[i].state != TASK_READY) {
+            continue;
+        }
+
+        if (!tasks[i].has_pending_event) {
+            continue;
+        }
+
+        if(best == NULL || tasks[i].priority < best->priority) {
+            best = &tasks[i];
+        }
+    }
+    return best;
+}
+
 
 static void idle_hook(void) {
     printf("[idle] no runnable tasks; MCU could enter WFI/WFE here\n");
 }
 
 static void scheduler_run(TCB tasks[], int count) {
-    while(!all_tasks_finished(tasks, count)) {
-        Event event;
+    /*
+    * Main scheduler loop.
+    *
+    * Events have already been delivered to task pending slots by post_event().
+    * The scheduler only selects the highest-priority READY task with pending work,
+    * restores its context, and waits for it to yield back.
+    */
+    while (!all_tasks_finished(tasks, count)) {
+        TCB *selected = select_highest_priority_ready_task(tasks, count);
 
-        if(!event_pop(&event_queue, &event)) {
+        if (selected == NULL) {
             idle_hook();
             break;
         }
 
-        if(event.target_task_id < 0 || event.target_task_id >= count) {
-            printf("[scheduler] drop invalid event target=%d\n", event.target_task_id);
-            continue;
-        }
-
-        TCB *task = &tasks[event.target_task_id];
-
-        if(task->state == TASK_FINISHED) {
-            printf("[scheduler] drop event for finished task=%s\n", task->name);
-            continue;
-        }
-
-        if (task->state == TASK_BLOCKED) {
-            printf("[scheduler] target task blocked, defer event=%s for %s\n",
-                event_name(event.type),
-                task->name);
-            event_push(&event_queue, event);
-            scheduler_tick(tasks, count);
-            continue;
-        }
-
-        current_event = event;
+        current_event = selected->pending_event;
         has_current_event = true;
+        selected->has_pending_event = false;
 
-        current_task = task;
-        task->state = TASK_RUNNING;
+        current_task = selected;
+        selected->state = TASK_RUNNING;
 
-        printf("[scheduler] event %s -> %s\n", event_name(event.type), task->name);
-        trace_context("restore", task);
+        printf("[scheduler] selected %s priority=%d event=%s\n",
+               selected->name,
+               selected->priority,
+               event_name(current_event.type));
 
-        if(swapcontext(&scheduler_context, &task->context) == -1) {
+        trace_context("restore", selected);
+
+        if (swapcontext(&scheduler_context, &selected->context) == -1) {
             die("swapcontext");
         }
+
         has_current_event = false;
-        scheduler_tick(tasks, count);
     }
+
     current_task = NULL;
     printf("\n[scheduler] event loop stopped\n");
 }
@@ -353,6 +403,15 @@ static void scheduler_run(TCB tasks[], int count) {
 
 int main(void)
 {
+    /*
+    * Demo scenario.
+    *
+    * UART_RX is posted first to the lower-priority io_task.
+    * BUTTON is posted second to the higher-priority control_task.
+    *
+    * Because scheduling is priority-based, control_task runs first even though
+    * its event was posted later.
+    */
     printf("context-switch-lab\n");
     TCB tasks[TASK_COUNT] = {
         {
@@ -360,12 +419,14 @@ int main(void)
             .name = "control_task",
             .state = TASK_READY,
             .entry = control_task,
+            .priority = 1,
         },
         {
             .id = 1,
             .name = "io_task",
             .state = TASK_READY,
             .entry = io_task,
+            .priority = 2,
         }
     };
 
@@ -375,15 +436,14 @@ int main(void)
 
     print_task_table(tasks, TASK_COUNT);
 
-    event_push(&event_queue, (Event){0, EVENT_TIMER, 1});
-    event_push(&event_queue, (Event){1, EVENT_UART_RX, 'A'});
-    event_push(&event_queue, (Event){0, EVENT_BUTTON, 2});
-    event_push(&event_queue, (Event){1, EVENT_UART_RX, 'B'});
-    event_push(&event_queue, (Event){0, EVENT_SHUTDOWN, 0});
-    event_push(&event_queue, (Event){1, EVENT_SHUTDOWN, 0});
+    post_event(tasks, TASK_COUNT, (Event){1, EVENT_UART_RX, 'A'});
+    post_event(tasks, TASK_COUNT, (Event){0, EVENT_BUTTON, 1});
 
-    
-    scheduler_run(tasks, TASK_COUNT); 
+    scheduler_run(tasks, TASK_COUNT);
+    post_event(tasks, TASK_COUNT, (Event){0, EVENT_SHUTDOWN, 0});
+    post_event(tasks, TASK_COUNT, (Event){1, EVENT_SHUTDOWN, 0});
+
+    scheduler_run(tasks, TASK_COUNT);
     print_task_table(tasks, TASK_COUNT);
 
     return 0;
